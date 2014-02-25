@@ -2619,6 +2619,143 @@ static void adreno_regwrite(struct kgsl_device *device,
 	__raw_writel(value, reg);
 }
 
+
+static unsigned int _get_context_id(struct kgsl_context *k_ctxt)
+{
+	unsigned int context_id = KGSL_MEMSTORE_GLOBAL;
+
+	if (k_ctxt != NULL) {
+		struct adreno_context *a_ctxt = ADRENO_CONTEXT(k_ctxt);
+		if (kgsl_context_detached(k_ctxt))
+			context_id = KGSL_CONTEXT_INVALID;
+		else if (a_ctxt->flags & CTXT_FLAGS_PER_CONTEXT_TS)
+			context_id = k_ctxt->id;
+	}
+
+	return context_id;
+}
+static unsigned int adreno_check_hw_ts(struct kgsl_device *device,
+		struct kgsl_context *context, unsigned int timestamp)
+{
+	int status = 0;
+	unsigned int ref_ts, enableflag;
+	unsigned int context_id = _get_context_id(context);
+
+	/*
+	 * If the context ID is invalid, we are in a race with
+	 * the context being destroyed by userspace so bail.
+	 */
+	if (context_id == KGSL_CONTEXT_INVALID) {
+		KGSL_DRV_WARN(device, "context was detached");
+		return -EINVAL;
+	}
+
+	status = kgsl_check_timestamp(device, context, timestamp);
+	if (status)
+		return status;
+
+	kgsl_sharedmem_readl(&device->memstore, &enableflag,
+			KGSL_MEMSTORE_OFFSET(context_id, ts_cmp_enable));
+	/*
+	 * Barrier is needed here to make sure the read from memstore
+	 * has posted
+	 */
+
+	mb();
+
+	if (enableflag) {
+		kgsl_sharedmem_readl(&device->memstore, &ref_ts,
+				KGSL_MEMSTORE_OFFSET(context_id,
+					ref_wait_ts));
+
+		/* Make sure the memstore read has posted */
+		mb();
+		if (timestamp_cmp(ref_ts, timestamp) >= 0) {
+			kgsl_sharedmem_writel(device, &device->memstore,
+					KGSL_MEMSTORE_OFFSET(context_id,
+						ref_wait_ts), timestamp);
+			/* Make sure the memstore write is posted */
+			wmb();
+		}
+	} else {
+		kgsl_sharedmem_writel(device, &device->memstore,
+				KGSL_MEMSTORE_OFFSET(context_id,
+					ref_wait_ts), timestamp);
+		enableflag = 1;
+		kgsl_sharedmem_writel(device, &device->memstore,
+				KGSL_MEMSTORE_OFFSET(context_id,
+					ts_cmp_enable), enableflag);
+
+		/* Make sure the memstore write gets posted */
+		wmb();
+
+		/*
+		 * submit a dummy packet so that even if all
+		 * commands upto timestamp get executed we will still
+		 * get an interrupt
+		 */
+
+		if (context && device->state != KGSL_STATE_SLUMBER) {
+			adreno_ringbuffer_issuecmds(device,
+					ADRENO_CONTEXT(context),
+					KGSL_CMD_FLAGS_GET_INT, NULL, 0);
+		}
+	}
+
+	return 0;
+}
+static int _check_pending_timestamp(struct kgsl_device *device,
+		struct kgsl_context *context, unsigned int timestamp)
+{
+	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
+	unsigned int context_id = _get_context_id(context);
+	unsigned int ts_issued;
+
+	if (context_id == KGSL_CONTEXT_INVALID)
+		return -EINVAL;
+
+	ts_issued = adreno_dev->ringbuffer.timestamp[context_id];
+
+	if (timestamp_cmp(timestamp, ts_issued) <= 0)
+		return 0;
+
+	if (context && !context->wait_on_invalid_ts) {
+		KGSL_DRV_ERR(device, "Cannot wait for invalid ts <%d:0x%x>, last issued ts <%d:0x%x>\n",
+			context_id, timestamp, context_id, ts_issued);
+
+			/* Only print this message once */
+			context->wait_on_invalid_ts = true;
+	}
+
+	return -EINVAL;
+}
+
+/*
+ wait_event_interruptible_timeout checks for the exit condition before
+ placing a process in wait q. For conditional interrupts we expect the
+ process to already be in its wait q when its exit condition checking
+ function is called.
+*/
+#define kgsl_wait_event_interruptible_timeout(wq, condition, timeout, io)\
+({									\
+	long __ret = timeout;						\
+	if (io)						\
+		__wait_io_event_interruptible_timeout(wq, condition, __ret);\
+	else						\
+		__wait_event_interruptible_timeout(wq, condition, __ret);\
+	__ret;								\
+})
+static int adreno_check_interrupt_timestamp(struct kgsl_device *device,
+		struct kgsl_context *context, unsigned int timestamp)
+{
+	int status;
+
+	mutex_lock(&device->mutex);
+	status = adreno_check_hw_ts(device, context, timestamp);
+	mutex_unlock(&device->mutex);
+
+	return status;
+}
 /**
  * adreno_waittimestamp - sleep while waiting for the specified timestamp
  * @device - pointer to a KGSL device structure
@@ -2633,28 +2770,137 @@ static int adreno_waittimestamp(struct kgsl_device *device,
 		unsigned int timestamp,
 		unsigned int msecs)
 {
-	int ret;
-	struct adreno_context *drawctxt;
+    
+	static unsigned int io_cnt;
+	struct adreno_context *adreno_ctx = context ? ADRENO_CONTEXT(context) :
+		NULL;
+	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+	unsigned int context_id = _get_context_id(context);
+	unsigned int time_elapsed = 0;
+	unsigned int wait;
+	int ts_compare = 1;
+	int io, ret = -ETIMEDOUT;
 
-	if (context == NULL) {
-		/* If they are doing then complain once */
-		dev_WARN_ONCE(device->dev, 1,
-			"IOCTL_KGSL_DEVICE_WAITTIMESTAMP is deprecated\n");
-		return -ENOTTY;
+	/* Get out early if the context has already been destroyed */
+
+	if (context_id == KGSL_CONTEXT_INVALID) {
+		KGSL_DRV_WARN(device, "context was detached");
+		return -EINVAL;
 	}
 
-	/* Return -EINVAL if the context has been detached */
-	if (kgsl_context_detached(context))
-		return -EINVAL;
+	/*
+	 * Check to see if the requested timestamp is "newer" then the last
+	 * timestamp issued. If it is complain once and return error.  Only
+	 * print the message once per context so that badly behaving
+	 * applications don't spam the logs
+	 */
 
-	ret = adreno_drawctxt_wait(ADRENO_DEVICE(device), context,
-		timestamp, msecs_to_jiffies(msecs));
+	/* this is sort of crack.. it would be racy to check the ts and the
+	 * wait on it, and this check is pointless.. so just get rid of it:
+	if (adreno_ctx && !(adreno_ctx->flags & CTXT_FLAGS_USER_GENERATED_TS)) {
+		if (_check_pending_timestamp(device, context, timestamp))
+			return -EINVAL;
 
-	/* If the context got invalidated then return a specific error */
-	drawctxt = ADRENO_CONTEXT(context);
+		context->wait_on_invalid_ts = false;
+	}
+	 */
 
-	if (drawctxt->state == ADRENO_CONTEXT_STATE_INVALID)
-		ret = -EDEADLK;
+	/*
+	 * On the first time through the loop only wait 100ms.
+	 * this gives enough time for the engine to start moving and oddly
+	 * provides better hang detection results than just going the full
+	 * KGSL_TIMEOUT_PART right off the bat. The exception to this rule
+	 * is if msecs happens to be < 100ms then just use the full timeout
+	 */
+
+	wait = 100;
+
+	do {
+		long status;
+
+		/*
+		 * if the timestamp happens while we're not
+		 * waiting, there's a chance that an interrupt
+		 * will not be generated and thus the timestamp
+		 * work needs to be queued.
+		 */
+
+		if (kgsl_check_timestamp(device, context, timestamp)) {
+			queue_work(device->work_queue, &device->ts_expired_ws);
+			ret = 0;
+			break;
+		}
+
+		/*
+		 * For proper power accounting sometimes we need to call
+		 * io_wait_interruptible_timeout and sometimes we need to call
+		 * plain old wait_interruptible_timeout. We call the regular
+		 * timeout N times out of 100, where N is a number specified by
+		 * the current power level
+		 */
+
+		io_cnt = (io_cnt + 1) % 100;
+		io = (io_cnt < pwr->pwrlevels[pwr->active_pwrlevel].io_fraction)
+			? 0 : 1;
+
+		mutex_unlock(&device->mutex);
+
+		/* Wait for a timestamp event */
+		status = kgsl_wait_event_interruptible_timeout(
+			device->wait_queue,
+			adreno_check_interrupt_timestamp(device, context,
+				timestamp), msecs_to_jiffies(wait), io);
+
+		mutex_lock(&device->mutex);
+
+		/*
+		 * If status is non zero then either the condition was satisfied
+		 * or there was an error.  In either event, this is the end of
+		 * the line for us
+		 */
+
+		if (status != 0) {
+			ret = (status > 0) ? 0 : (int) status;
+			break;
+		}
+		time_elapsed += wait;
+
+		/* If user specified timestamps are being used, wait at least
+		 * KGSL_SYNCOBJ_SERVER_TIMEOUT msecs for the user driver to
+		 * issue a IB for a timestamp before checking to see if the
+		 * current timestamp we are waiting for is valid or not
+		 */
+
+		if (ts_compare && (adreno_ctx &&
+			(adreno_ctx->flags & CTXT_FLAGS_USER_GENERATED_TS))) {
+			if (time_elapsed > KGSL_SYNCOBJ_SERVER_TIMEOUT) {
+				ret = _check_pending_timestamp(device, context,
+					timestamp);
+				if (ret)
+					break;
+
+				/* Don't do this check again */
+				ts_compare = 0;
+
+				/*
+				 * Reset the invalid timestamp flag on a valid
+				 * wait
+				 */
+				context->wait_on_invalid_ts = false;
+			}
+		}
+
+		/*
+		 * We want to wait the floor of KGSL_TIMEOUT_PART
+		 * and (msecs - time_elapsed).
+		 */
+
+		if (KGSL_TIMEOUT_PART < (msecs - time_elapsed))
+			wait = KGSL_TIMEOUT_PART;
+		else
+			wait = (msecs - time_elapsed);
+
+	} while (!msecs || time_elapsed < msecs);
 
 	return ret;
 }
