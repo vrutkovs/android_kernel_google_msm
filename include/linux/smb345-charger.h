@@ -13,12 +13,13 @@
 #if SMB_DEBUG
 #define SMB_INFO(format, arg...)	\
 	printk(KERN_INFO "smb345_charger: [%s] " format , __func__ , ## arg)
-#else
-#define SMB_INFO(format, arg...)
-#endif
-
 #define SMB_NOTICE(format, arg...)	\
 	printk(KERN_NOTICE "smb345_charger: [%s] " format , __func__ , ## arg)
+#else
+#define SMB_INFO(format, arg...)
+#define SMB_NOTICE(format, arg...)
+#endif
+
 
 #define SMB_ERR(format, arg...)	\
 	printk(KERN_ERR "smb345_charger: [%s] " format , __func__ , ## arg)
