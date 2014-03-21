@@ -16,6 +16,8 @@
  * more details.
  */
 
+#define DEBUG 0
+
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -58,9 +60,13 @@
 #define THERMAL_RULE1 1
 #define THERMAL_RULE2 2
 
+#if DEBUG
 /* Debug Message */
 #define BAT_NOTICE(format, arg...)	\
 	printk(KERN_NOTICE "%s " format , __FUNCTION__ , ## arg)
+#else
+#define BAT_NOTICE(format, arg...) do {} while (0)
+#endif
 
 #define BAT_ERR(format, arg...)		\
 	printk(KERN_ERR format , ## arg)
@@ -76,8 +82,9 @@ static unsigned int 	battery_current;
 static unsigned int  battery_remaining_capacity;
 struct workqueue_struct *bq27541_battery_work_queue = NULL;
 static unsigned int battery_check_interval = BATTERY_POLLING_RATE;
+#if DEBUG
 static char *status_text[] = {"Unknown", "Charging", "Discharging", "Not charging", "Full"};
-
+#endif
 /* Functions declaration */
 static int bq27541_get_psp(int reg_offset, enum power_supply_property psp,union power_supply_propval *val);
 static int bq27541_get_property(struct power_supply *psy,
